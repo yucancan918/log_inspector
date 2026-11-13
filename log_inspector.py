@@ -33,6 +33,7 @@ sys.excepthook = _excepthook
 
 import re
 import csv
+import shutil
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Set
 import warnings
@@ -41,8 +42,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QLabel, QLineEdit, QPushButton, QFileDialog,
                              QProgressBar, QTextEdit, QPlainTextEdit, QTabWidget, QGroupBox, QCheckBox,
                              QMessageBox, QDialog, QDialogButtonBox, QRadioButton, QButtonGroup,
-                             QSpinBox, QComboBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QSize
+                             QSpinBox, QComboBox, QTimeEdit)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QSize, QTime
 from PyQt6.QtGui import QFont, QPainter, QColor, QTextFormat
 
 SUPPORTED_EXTS = [".elog", ".log", ".txt", "ALL"]
@@ -353,6 +354,17 @@ def _sanitize_text(s: str) -> str:
     return s
 
 
+def _csv_row(item):
+    val_str = str(item.extracted_val) if item.extracted_val is not None else ""
+    return [
+        _sanitize_text(item.filepath),
+        item.line_no,
+        _sanitize_text(item.hit_keyword),
+        val_str,
+        _sanitize_text(item.line_content),
+    ]
+
+
 def _export_csv_in_main_thread(parent, save_path, items, on_done, cancel_flag_getter=None):
     import csv as _csv
     try:
@@ -405,15 +417,7 @@ def _export_csv_in_main_thread(parent, save_path, items, on_done, cancel_flag_ge
         try:
             end = min(idx[0] + BATCH, total)
             for i in range(idx[0], end):
-                item = items[i]
-                val_str = str(item.extracted_val) if item.extracted_val is not None else ""
-                writer.writerow([
-                    _sanitize_text(item.filepath),
-                    item.line_no,
-                    _sanitize_text(item.hit_keyword),
-                    val_str,
-                    _sanitize_text(item.line_content),
-                ])
+                writer.writerow(_csv_row(items[i]))
             idx[0] = end
         except Exception as e:
             finished[0] = True
@@ -450,6 +454,210 @@ def _export_csv_in_main_thread(parent, save_path, items, on_done, cancel_flag_ge
             on_done(True)
 
     QTimer.singleShot(1, do_batch)
+
+
+class AutoAnalyzeThread(QThread):
+    sig_finished = pyqtSignal(bool, str, dict)
+
+    def __init__(self, scan_path, keywords, ext_filter, selected_levels,
+                 output_dir, already_copied):
+        super().__init__()
+        self.scan_path = scan_path
+        self.keywords = keywords
+        self.ext_filter = ext_filter
+        self.selected_levels = selected_levels
+        self.output_dir = output_dir
+        self.already_copied = dict(already_copied)
+        self.errors: List[str] = []
+        self._file_hit_dict: Dict[str, int] = {}
+        self._kw_hit_dict: Dict[str, int] = {}
+        self._csv_items: List[CsvLogItem] = []
+        self._stopped = False
+        self._scanner = None
+
+    def stop(self):
+        self._stopped = True
+        if self._scanner is not None:
+            self._scanner.stop()
+
+    def _on_scanner_finished(self, hit_dict, kw_hit_dict, ref_data_list, csv_items):
+        self._file_hit_dict = hit_dict
+        self._kw_hit_dict = kw_hit_dict
+        self._csv_items = csv_items
+
+    def _on_scanner_error(self, msg):
+        self.errors.append(msg)
+
+    def run(self):
+        ts = datetime.datetime.now()
+        ts_str = ts.strftime("%Y%m%d_%H%M%S")
+        report_path = os.path.join(self.output_dir, f"auto_analysis_report_{ts_str}.txt")
+
+        if not self.scan_path:
+            self.errors.append("扫描路径为空，未执行扫描")
+        elif not os.path.exists(self.scan_path):
+            self.errors.append(f"扫描路径不存在：{self.scan_path}")
+        else:
+            is_single = os.path.isfile(self.scan_path)
+            folder = os.path.dirname(self.scan_path) if is_single else self.scan_path
+            self._scanner = FolderScanThread(
+                folder=folder,
+                keywords=self.keywords,
+                ext_filter=self.ext_filter,
+                selected_levels=self.selected_levels,
+                extract_value=False,
+            )
+            if is_single:
+                self._scanner._collect_files = lambda: [self.scan_path]
+            self._scanner.sig_error_log.connect(
+                self._on_scanner_error, Qt.ConnectionType.DirectConnection)
+            self._scanner.sig_finished.connect(
+                self._on_scanner_finished, Qt.ConnectionType.DirectConnection)
+            try:
+                self._scanner.run()
+            except Exception as e:
+                self.errors.append(f"扫描执行失败：{e}")
+
+        if self._stopped:
+            self.sig_finished.emit(False, report_path, {})
+            return
+
+        csv_path = ""
+        if self._csv_items:
+            csv_name = f"auto_analysis_detail_{ts_str}.csv"
+            csv_path = os.path.join(self.output_dir, csv_name)
+            try:
+                self._write_csv(csv_path, self._csv_items)
+            except Exception as e:
+                self.errors.append(f"CSV明细导出失败：{e}")
+                csv_path = ""
+
+        try:
+            copied = self._copy_hit_files(self._file_hit_dict)
+        except Exception as e:
+            copied = {}
+            self.errors.append(f"复制日志文件阶段异常：{e}")
+
+        try:
+            self._write_report(report_path, ts, self._file_hit_dict,
+                               self._kw_hit_dict, len(self._csv_items),
+                               csv_path, copied)
+        except Exception as e:
+            self.errors.append(f"汇总报告写入失败：{e}")
+
+        self.sig_finished.emit(True, report_path, copied)
+
+    def _write_csv(self, path, items):
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["FilePath", "LineNumber", "HitKeyword", "ExtractedValue", "LogContent"])
+            for item in items:
+                writer.writerow(_csv_row(item))
+
+    def _copy_hit_files(self, file_hit_dict):
+        if not os.path.isdir(self.output_dir):
+            os.makedirs(self.output_dir, exist_ok=True)
+        try:
+            used_names = set(os.listdir(self.output_dir))
+        except Exception:
+            used_names = set()
+        copied = {}
+        for fp, cnt in file_hit_dict.items():
+            if self._stopped:
+                break
+            if cnt <= 0:
+                continue
+            prev_dst = self.already_copied.get(fp)
+            if prev_dst and os.path.exists(prev_dst):
+                continue
+            try:
+                if not os.path.isfile(fp):
+                    self.errors.append(f"复制失败：源文件不存在或不可读：{fp}")
+                    continue
+                if prev_dst:
+                    dst = self._unique_dst_for_base(os.path.basename(prev_dst), used_names)
+                else:
+                    dst = self._unique_dst(fp, used_names)
+                shutil.copy2(fp, dst)
+                copied[fp] = dst
+            except PermissionError as e:
+                self.errors.append(f"复制失败（权限不足）：{fp} | {e}")
+            except OSError as e:
+                self.errors.append(f"复制失败：{fp} | {e}")
+            except Exception as e:
+                self.errors.append(f"复制失败：{fp} | {e}")
+        return copied
+
+    def _unique_dst(self, src, used_names):
+        return self._unique_dst_for_base(os.path.basename(src), used_names)
+
+    def _unique_dst_for_base(self, base, used_names):
+        if base not in used_names:
+            used_names.add(base)
+            return os.path.join(self.output_dir, base)
+        stem, ext = os.path.splitext(base)
+        i = 2
+        while True:
+            candidate = f"{stem}_{i}{ext}"
+            if candidate not in used_names:
+                used_names.add(candidate)
+                return os.path.join(self.output_dir, candidate)
+            i += 1
+
+    def _write_report(self, path, ts, file_hit_dict, kw_hit_dict,
+                      csv_total, csv_path, copied):
+        lines = []
+        lines.append("=" * 64)
+        lines.append("【汇总报告】")
+        lines.append("=" * 64)
+        lines.append(f"扫描时间：{ts.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"扫描路径：{self.scan_path}")
+        lines.append(f"文件后缀类型：{self.ext_filter}")
+        level_str = "、".join(sorted(self.selected_levels)) if self.selected_levels else "(不限制)"
+        lines.append(f"日志等级筛选：{level_str}")
+        kw_str = "、".join(self.keywords) if self.keywords else "(空，不限制关键字)"
+        lines.append(f"搜索关键字：{kw_str}")
+        lines.append("")
+        lines.append("-" * 64)
+        lines.append("命中文件清单：")
+        hit_files = [(fp, cnt) for fp, cnt in file_hit_dict.items() if cnt > 0]
+        if hit_files:
+            for i, (fp, cnt) in enumerate(hit_files, 1):
+                lines.append(f"  {i}. {fp} | 命中 {cnt} 条")
+        else:
+            lines.append("  (无命中文件)")
+        lines.append("")
+        lines.append("-" * 64)
+        lines.append("各关键字命中统计：")
+        if kw_hit_dict:
+            for kw, cnt in kw_hit_dict.items():
+                lines.append(f"  关键字【{kw}】：{cnt} 条")
+        else:
+            lines.append("  (无关键字筛选)")
+        lines.append("")
+        lines.append("-" * 64)
+        lines.append(f"CSV明细文件：{csv_path if csv_path else '(未生成)'}")
+        lines.append(f"命中记录总数：{csv_total} 条")
+        lines.append("")
+        lines.append("-" * 64)
+        lines.append("复制日志文件：")
+        if copied:
+            for fp in copied:
+                lines.append(f"  {fp}")
+        else:
+            lines.append("  (无新复制文件)")
+        lines.append("")
+        lines.append("-" * 64)
+        lines.append("异常信息：")
+        if self.errors:
+            for e in self.errors:
+                lines.append(f"  ✗ {e}")
+        else:
+            lines.append("  (无)")
+        lines.append("")
+        lines.append("=" * 64)
+        with open(path, "w", encoding="utf-8-sig") as f:
+            f.write("\n".join(lines))
 
 
 class FilterExportThread(QThread):
@@ -1008,6 +1216,14 @@ class MainWindow(QMainWindow):
         self._csv_export_cancel = False
         self._batch_dlg = None
 
+        self.auto_thread: Optional[AutoAnalyzeThread] = None
+        self.auto_copied_files: Dict[str, str] = {}
+        self.schedule_time: Optional[QTime] = None
+        self.schedule_active = False
+        self.schedule_timer = QTimer(self)
+        self.schedule_timer.setInterval(1000)
+        self.schedule_timer.timeout.connect(self._on_schedule_tick)
+
         self.find_index = 0
         self.last_find_text = ""
         self.find_busy = False
@@ -1094,6 +1310,37 @@ class MainWindow(QMainWindow):
         row_key.addWidget(self.btn_stop_scan)
         layout_search.addLayout(row_key)
         main_layout.addWidget(group_search)
+
+        group_auto = QGroupBox("自动分析 / 定时任务")
+        auto_layout = QVBoxLayout(group_auto)
+
+        row_manual = QHBoxLayout()
+        self.btn_auto_analyze = QPushButton("自动分析")
+        self.btn_auto_analyze.clicked.connect(self.auto_analyze_manual)
+        self.label_auto_status = QLabel("自动分析结果（txt / CSV / 日志文件）将保存到程序同级目录")
+        self.label_auto_status.setWordWrap(True)
+        row_manual.addWidget(self.btn_auto_analyze)
+        row_manual.addWidget(self.label_auto_status, 1)
+        auto_layout.addLayout(row_manual)
+
+        row_schedule = QHBoxLayout()
+        row_schedule.addWidget(QLabel("定时执行时间："))
+        self.edit_schedule_time = QTimeEdit()
+        self.edit_schedule_time.setDisplayFormat("HH:mm:ss")
+        self.edit_schedule_time.setTime(QTime(8, 30))
+        self.btn_schedule_start = QPushButton("启动定时")
+        self.btn_schedule_start.clicked.connect(self.start_schedule)
+        self.btn_schedule_stop = QPushButton("取消定时")
+        self.btn_schedule_stop.clicked.connect(self.stop_schedule)
+        self.btn_schedule_stop.setEnabled(False)
+        self.label_countdown = QLabel("下次执行倒计时：--:--:--")
+        row_schedule.addWidget(self.edit_schedule_time)
+        row_schedule.addWidget(self.btn_schedule_start)
+        row_schedule.addWidget(self.btn_schedule_stop)
+        row_schedule.addWidget(self.label_countdown)
+        auto_layout.addLayout(row_schedule)
+
+        main_layout.addWidget(group_auto)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -1206,6 +1453,95 @@ class MainWindow(QMainWindow):
         if self.chk_error.isChecked(): levels.add("Error")
         if self.chk_fatal.isChecked(): levels.add("Fatal")
         return levels
+
+    def auto_analyze_manual(self):
+        self._start_auto_analysis(silent=False)
+
+    def _start_auto_analysis(self, silent=False):
+        if self.auto_thread is not None and self.auto_thread.isRunning():
+            self.label_auto_status.setText("自动分析正在执行中，请稍候...")
+            return
+
+        path = self._clean_path(self.edit_path.text())
+        keywords = [k.strip() for k in self.edit_keyword.text().split(",") if k.strip()]
+        selected_levels = self.current_levels()
+        ext = self.combo_ext.currentText()
+
+        self.auto_thread = AutoAnalyzeThread(
+            scan_path=path,
+            keywords=keywords,
+            ext_filter=ext,
+            selected_levels=selected_levels,
+            output_dir=_log_dir,
+            already_copied=self.auto_copied_files,
+        )
+        self.auto_thread.sig_finished.connect(self._on_auto_finished)
+        self.auto_thread.finished.connect(self._on_auto_thread_finished)
+        self.auto_thread.start()
+
+        if silent:
+            self.label_auto_status.setText(
+                f"定时自动分析已触发：{datetime.datetime.now().strftime('%H:%M:%S')}")
+        else:
+            self.label_auto_status.setText("自动分析执行中...")
+
+    def _on_auto_finished(self, ok, report_path, copied):
+        self.auto_copied_files.update(copied)
+        if ok:
+            self.label_auto_status.setText(
+                f"自动分析完成，报告：{os.path.basename(report_path)}")
+        else:
+            self.label_auto_status.setText("自动分析已停止")
+
+    def _on_auto_thread_finished(self):
+        self.auto_thread = None
+
+    def start_schedule(self):
+        self.schedule_time = self.edit_schedule_time.time()
+        self.schedule_active = True
+        self.btn_schedule_start.setEnabled(False)
+        self.btn_schedule_stop.setEnabled(True)
+        self.schedule_timer.start()
+        self._update_countdown()
+        self.label_auto_status.setText("定时任务已启动，到达设定时间后自动执行")
+
+    def stop_schedule(self):
+        self.schedule_active = False
+        self.schedule_time = None
+        self.schedule_timer.stop()
+        self.btn_schedule_start.setEnabled(True)
+        self.btn_schedule_stop.setEnabled(False)
+        self.label_countdown.setText("下次执行倒计时：--:--:--")
+
+    def _on_schedule_tick(self):
+        if not self.schedule_active or self.schedule_time is None:
+            return
+        remaining = self._schedule_remaining_seconds()
+        if remaining <= 0:
+            self.stop_schedule()
+            self._start_auto_analysis(silent=True)
+        else:
+            self._update_countdown(remaining)
+
+    def _schedule_remaining_seconds(self):
+        if self.schedule_time is None:
+            return -1
+        now = QTime.currentTime()
+        secs = now.secsTo(self.schedule_time)
+        if secs < 0:
+            secs += 86400
+        return secs
+
+    def _update_countdown(self, remaining=None):
+        if remaining is None:
+            remaining = self._schedule_remaining_seconds()
+        if remaining < 0:
+            self.label_countdown.setText("下次执行倒计时：--:--:--")
+            return
+        h = remaining // 3600
+        m = (remaining % 3600) // 60
+        s = remaining % 60
+        self.label_countdown.setText(f"下次执行倒计时：{h:02d}:{m:02d}:{s:02d}")
 
     def start_scan(self):
         path = self.edit_path.text().strip().strip("|").strip()
@@ -1484,9 +1820,13 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.stop_scan()
         self._csv_export_cancel = True
+        self.schedule_timer.stop()
         if self.filter_thread and self.filter_thread.isRunning():
             self.filter_thread.stop()
             self.filter_thread.wait(3000)
+        if self.auto_thread is not None and self.auto_thread.isRunning():
+            self.auto_thread.stop()
+            self.auto_thread.wait(3000)
         super().closeEvent(event)
 
 
