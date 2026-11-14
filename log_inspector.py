@@ -42,8 +42,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QLabel, QLineEdit, QPushButton, QFileDialog,
                              QProgressBar, QTextEdit, QPlainTextEdit, QTabWidget, QGroupBox, QCheckBox,
                              QMessageBox, QDialog, QDialogButtonBox, QRadioButton, QButtonGroup,
-                             QSpinBox, QComboBox, QTimeEdit)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QSize, QTime
+                             QSpinBox, QComboBox, QTimeEdit, QDateTimeEdit)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QSize, QTime, QDateTime, QDate
 from PyQt6.QtGui import QFont, QPainter, QColor, QTextFormat
 
 SUPPORTED_EXTS = [".elog", ".log", ".txt", "ALL"]
@@ -1218,7 +1218,7 @@ class MainWindow(QMainWindow):
 
         self.auto_thread: Optional[AutoAnalyzeThread] = None
         self.auto_copied_files: Dict[str, str] = {}
-        self.schedule_time: Optional[QTime] = None
+        self.schedule_time: Optional[QDateTime] = None
         self.schedule_active = False
         self.schedule_timer = QTimer(self)
         self.schedule_timer.setInterval(1000)
@@ -1325,9 +1325,11 @@ class MainWindow(QMainWindow):
 
         row_schedule = QHBoxLayout()
         row_schedule.addWidget(QLabel("定时执行时间："))
-        self.edit_schedule_time = QTimeEdit()
-        self.edit_schedule_time.setDisplayFormat("HH:mm:ss")
-        self.edit_schedule_time.setTime(QTime(8, 30))
+        self.edit_schedule_time = QDateTimeEdit()
+        self.edit_schedule_time.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.edit_schedule_time.setCalendarPopup(True)
+        default_dt = QDateTime(QDate.currentDate(), QTime(8, 45))
+        self.edit_schedule_time.setDateTime(default_dt)
         self.btn_schedule_start = QPushButton("启动定时")
         self.btn_schedule_start.clicked.connect(self.start_schedule)
         self.btn_schedule_stop = QPushButton("取消定时")
@@ -1463,6 +1465,13 @@ class MainWindow(QMainWindow):
             return
 
         path = self._clean_path(self.edit_path.text())
+        if not path:
+            QMessageBox.warning(self, "缺少源路径", "主页面扫描路径为空！请先在主页面选择文件或文件夹")
+            return
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "路径无效", f"路径不存在：{path}")
+            return
+
         keywords = [k.strip() for k in self.edit_keyword.text().split(",") if k.strip()]
         selected_levels = self.current_levels()
         ext = self.combo_ext.currentText()
@@ -1497,7 +1506,15 @@ class MainWindow(QMainWindow):
         self.auto_thread = None
 
     def start_schedule(self):
-        self.schedule_time = self.edit_schedule_time.time()
+        path = self._clean_path(self.edit_path.text())
+        if not path:
+            QMessageBox.warning(self, "缺少源路径", "主页面扫描路径为空！请先在主页面选择文件或文件夹")
+            return
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "路径无效", f"路径不存在：{path}")
+            return
+
+        self.schedule_time = self.edit_schedule_time.dateTime()
         self.schedule_active = True
         self.btn_schedule_start.setEnabled(False)
         self.btn_schedule_stop.setEnabled(True)
@@ -1526,7 +1543,7 @@ class MainWindow(QMainWindow):
     def _schedule_remaining_seconds(self):
         if self.schedule_time is None:
             return -1
-        now = QTime.currentTime()
+        now = QDateTime.currentDateTime()
         secs = now.secsTo(self.schedule_time)
         if secs < 0:
             secs += 86400

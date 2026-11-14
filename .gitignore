@@ -13,6 +13,10 @@ env/
 Thumbs.db
 *.log
 *.csv
+*.json
 .idea/
 .vscode/
 app_error.log
+allure-results/
+allure-report/
+.pytest_cache/
