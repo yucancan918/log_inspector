@@ -156,15 +156,17 @@ class FolderScanThread(QThread):
     sig_result_batch = pyqtSignal(list)
     sig_raw_text = pyqtSignal(str, str)
     sig_stat_update = pyqtSignal(int, dict)
-    sig_finished = pyqtSignal(dict, dict, list, list)
+    sig_finished = pyqtSignal(dict, dict, list, list, set)
     sig_error_log = pyqtSignal(str)
 
     def __init__(self, folder: str, keywords: List[str], ext_filter: str,
                  selected_levels: Set[str],
-                 extract_value: bool = False):
+                 extract_value: bool = False,
+                 export_keywords: Optional[List[str]] = None):
         super().__init__()
         self.folder = folder
         self.keywords = [kw for kw in keywords if kw]
+        self.export_keywords = [kw for kw in (export_keywords or []) if kw]
         self.ext_filter = ext_filter
         self.selected_levels = selected_levels
         self.extract_value = extract_value
@@ -172,12 +174,17 @@ class FolderScanThread(QThread):
 
         self.re_dict: Dict[str, re.Pattern] = {}
         self.key_patterns: Dict[str, re.Pattern] = {}
+        self.export_patterns: Dict[str, re.Pattern] = {}
         self.level_re: Optional[re.Pattern] = None
+        self.export_hit_files: Set[str] = set()
 
         for kw in self.keywords:
             self.key_patterns[kw] = re.compile(re.escape(kw))
             if extract_value:
                 self.re_dict[kw] = re.compile(re.escape(kw) + r".*?([+-]?(?:\d+\.\d*|\.\d+|\d+))")
+
+        for kw in self.export_keywords:
+            self.export_patterns[kw] = re.compile(re.escape(kw))
 
         if selected_levels:
             escaped = [re.escape(l) for l in selected_levels]
@@ -188,7 +195,7 @@ class FolderScanThread(QThread):
         total = len(file_list)
 
         if total == 0:
-            self.sig_finished.emit({}, {}, [], [])
+            self.sig_finished.emit({}, {}, [], [], set())
             return
 
         no_filter = (not self.key_patterns) and (self.level_re is None)
@@ -220,7 +227,7 @@ class FolderScanThread(QThread):
                     self.sig_error_log.emit(f"读取失败: {fp} | {e}")
                     file_hit_dict[fp] = 0
             self.sig_progress.emit(100, total, total)
-            self.sig_finished.emit(file_hit_dict, kw_hit_dict, ref_data_list, csv_item_list)
+            self.sig_finished.emit(file_hit_dict, kw_hit_dict, ref_data_list, csv_item_list, self.export_hit_files)
             return
 
         batch: List[SearchResultItem] = []
@@ -253,7 +260,7 @@ class FolderScanThread(QThread):
         if batch:
             self.sig_result_batch.emit(batch)
 
-        self.sig_finished.emit(file_hit_dict, kw_hit_dict, ref_data_list, csv_item_list)
+        self.sig_finished.emit(file_hit_dict, kw_hit_dict, ref_data_list, csv_item_list, self.export_hit_files)
 
     def _read_file_text(self, fp: str) -> str:
         try:
@@ -282,6 +289,9 @@ class FolderScanThread(QThread):
             i += 1
             if self.level_re is not None and not self.level_re.search(line):
                 continue
+            if self.export_patterns and fp not in self.export_hit_files:
+                if any(ep.search(line) for ep in self.export_patterns.values()):
+                    self.export_hit_files.add(fp)
             if not self.key_patterns:
                 hit_count += 1
                 batch.append(SearchResultItem(
@@ -459,11 +469,12 @@ def _export_csv_in_main_thread(parent, save_path, items, on_done, cancel_flag_ge
 class AutoAnalyzeThread(QThread):
     sig_finished = pyqtSignal(bool, str, dict)
 
-    def __init__(self, scan_path, keywords, ext_filter, selected_levels,
+    def __init__(self, scan_path, keywords, export_keywords, ext_filter, selected_levels,
                  output_dir, already_copied):
         super().__init__()
         self.scan_path = scan_path
         self.keywords = keywords
+        self.export_keywords = export_keywords
         self.ext_filter = ext_filter
         self.selected_levels = selected_levels
         self.output_dir = output_dir
@@ -472,6 +483,7 @@ class AutoAnalyzeThread(QThread):
         self._file_hit_dict: Dict[str, int] = {}
         self._kw_hit_dict: Dict[str, int] = {}
         self._csv_items: List[CsvLogItem] = []
+        self._export_hit_files: Set[str] = set()
         self._stopped = False
         self._scanner = None
 
@@ -480,10 +492,11 @@ class AutoAnalyzeThread(QThread):
         if self._scanner is not None:
             self._scanner.stop()
 
-    def _on_scanner_finished(self, hit_dict, kw_hit_dict, ref_data_list, csv_items):
+    def _on_scanner_finished(self, hit_dict, kw_hit_dict, ref_data_list, csv_items, export_hit_files):
         self._file_hit_dict = hit_dict
         self._kw_hit_dict = kw_hit_dict
         self._csv_items = csv_items
+        self._export_hit_files = set(export_hit_files)
 
     def _on_scanner_error(self, msg):
         self.errors.append(msg)
@@ -503,6 +516,7 @@ class AutoAnalyzeThread(QThread):
             self._scanner = FolderScanThread(
                 folder=folder,
                 keywords=self.keywords,
+                export_keywords=self.export_keywords,
                 ext_filter=self.ext_filter,
                 selected_levels=self.selected_levels,
                 extract_value=False,
@@ -567,6 +581,8 @@ class AutoAnalyzeThread(QThread):
                 break
             if cnt <= 0:
                 continue
+            if fp not in self._export_hit_files:
+                continue
             prev_dst = self.already_copied.get(fp)
             if prev_dst and os.path.exists(prev_dst):
                 continue
@@ -617,6 +633,11 @@ class AutoAnalyzeThread(QThread):
         lines.append(f"日志等级筛选：{level_str}")
         kw_str = "、".join(self.keywords) if self.keywords else "(空，不限制关键字)"
         lines.append(f"搜索关键字：{kw_str}")
+        export_kw_str = "、".join(self.export_keywords) if self.export_keywords else "(空)"
+        count_kw_str = "、".join(list(set(self.keywords) - set(self.export_keywords))) if self.keywords else "(空)"
+        lines.append(f"需导出关键字（命中即复制日志）：{export_kw_str}")
+        lines.append(f"仅统计关键字（只计数不复制）：{count_kw_str}")
+        lines.append("复制规则：文件只要包含任一“需导出关键字”即复制整个日志；仅命中“仅统计关键字”则只计数、不复制。")
         lines.append("")
         lines.append("-" * 64)
         lines.append("命中文件清单：")
@@ -1118,7 +1139,7 @@ class LogScanDialog(QDialog):
     def on_file_done(self, fp: str, cnt: int):
         self.file_hit_result[fp] = cnt
 
-    def on_all_finished(self, hit_dict, kw_hit_dict, ref_data_list, csv_items):
+    def on_all_finished(self, hit_dict, kw_hit_dict, ref_data_list, csv_items, export_hit_files):
         self.file_hit_result = hit_dict
         self.kw_hit_result = kw_hit_dict
         self.csv_hit_items = csv_items
@@ -1206,7 +1227,7 @@ class LogScanDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("日志分析工具 V2.2 ")
+        self.setWindowTitle("日志分析工具 V2.3 ")
         self.resize(1150, 860)
         self.search_results: List[SearchResultItem] = []
         self.scan_thread: Optional[FolderScanThread] = None
@@ -1226,7 +1247,6 @@ class MainWindow(QMainWindow):
 
         self.find_index = 0
         self.last_find_text = ""
-        self.find_busy = False
         self._ui_buf: List[str] = []
 
         self.setAcceptDrops(True)
@@ -1297,18 +1317,29 @@ class MainWindow(QMainWindow):
         layout_search.addLayout(row_level)
 
         row_key = QHBoxLayout()
-        row_key.addWidget(QLabel("关键字(英文逗号分隔)："))
+        row_key.addWidget(QLabel("需导出关键字(命中即复制日志)："))
         self.edit_keyword = QLineEdit()
-        self.edit_keyword.setPlaceholderText("示例：error,fail,critical")
+        self.edit_keyword.setPlaceholderText("命中则复制整个日志文件，示例：error,fail,critical")
         self.btn_start_scan = QPushButton("开始扫描")
         self.btn_start_scan.clicked.connect(self.start_scan)
         self.btn_stop_scan = QPushButton("停止")
         self.btn_stop_scan.clicked.connect(self.stop_scan)
         self.btn_stop_scan.setEnabled(False)
-        row_key.addWidget(self.edit_keyword)
+        row_key.addWidget(self.edit_keyword, 1)
         row_key.addWidget(self.btn_start_scan)
         row_key.addWidget(self.btn_stop_scan)
         layout_search.addLayout(row_key)
+
+        row_key2 = QHBoxLayout()
+        row_key2.addWidget(QLabel("仅统计关键字(只计数不复制)："))
+        self.edit_count_keyword = QLineEdit()
+        self.edit_count_keyword.setPlaceholderText("只在报告中统计次数，不复制日志，示例：notice,info")
+        row_key2.addWidget(self.edit_count_keyword, 1)
+        hint2 = QLabel("若文件仅命中“仅统计关键字”→只计数、不复制；只要命中任一“需导出关键字”→复制整个日志")
+        hint2.setStyleSheet("color: #888; font-size: 11px;")
+        hint2.setWordWrap(True)
+        row_key2.addWidget(hint2)
+        layout_search.addLayout(row_key2)
         main_layout.addWidget(group_search)
 
         group_auto = QGroupBox("自动分析 / 定时任务")
@@ -1472,13 +1503,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "路径无效", f"路径不存在：{path}")
             return
 
-        keywords = [k.strip() for k in self.edit_keyword.text().split(",") if k.strip()]
+        export_keywords = [k.strip() for k in self.edit_keyword.text().split(",") if k.strip()]
+        count_only_keywords = [k.strip() for k in self.edit_count_keyword.text().split(",") if k.strip()]
+        keywords = export_keywords + count_only_keywords
         selected_levels = self.current_levels()
         ext = self.combo_ext.currentText()
 
         self.auto_thread = AutoAnalyzeThread(
             scan_path=path,
             keywords=keywords,
+            export_keywords=export_keywords,
             ext_filter=ext,
             selected_levels=selected_levels,
             output_dir=_log_dir,
@@ -1563,7 +1597,6 @@ class MainWindow(QMainWindow):
     def start_scan(self):
         path = self.edit_path.text().strip().strip("|").strip()
         self.edit_path.setText(path)
-        key_raw = self.edit_keyword.text().strip()
         if not path:
             QMessageBox.warning(self, "错误", "请选择有效的文件夹或文件路径")
             return
@@ -1573,7 +1606,9 @@ class MainWindow(QMainWindow):
         if self.scan_thread is not None and self.scan_thread.isRunning():
             return
 
-        keywords = [k.strip() for k in key_raw.split(",") if k.strip()]
+        export_keywords = [k.strip() for k in self.edit_keyword.text().split(",") if k.strip()]
+        count_only_keywords = [k.strip() for k in self.edit_count_keyword.text().split(",") if k.strip()]
+        keywords = export_keywords + count_only_keywords
         selected_levels = self.current_levels()
 
         ext = self.combo_ext.currentText()
@@ -1594,8 +1629,8 @@ class MainWindow(QMainWindow):
         self.btn_stop_scan.setEnabled(True)
 
         self.scan_thread = FolderScanThread(
-            folder=folder, keywords=keywords, ext_filter=ext,
-            selected_levels=selected_levels, extract_value=False
+            folder=folder, keywords=keywords, export_keywords=export_keywords,
+            ext_filter=ext, selected_levels=selected_levels, extract_value=False
         )
         if is_single:
             self.scan_thread._collect_files = lambda: [path]
@@ -1647,8 +1682,15 @@ class MainWindow(QMainWindow):
         self.tab_result.appendPlainText(text.rstrip("\n"))
         self.tab_result.setUpdatesEnabled(True)
         self.tab_result.viewport().update()
+        lines = text.splitlines()
+        for ln, line in enumerate(lines, 1):
+            self.search_results.append(SearchResultItem(
+                line_no=ln,
+                line_content=line,
+                filepath=fp
+            ))
 
-    def _on_scan_finished(self, hit_dict, kw_hit_dict, ref_data_list, csv_items):
+    def _on_scan_finished(self, hit_dict, kw_hit_dict, ref_data_list, csv_items, export_hit_files):
         self._flush_buf_to_result()
 
         self.progress_bar.setValue(100)
@@ -1699,13 +1741,13 @@ class MainWindow(QMainWindow):
                                     cancel_flag_getter=lambda: self._csv_export_cancel)
 
     def find_next(self):
-        if self.find_busy:
-            return
         txt = self.edit_find.text().strip()
-        if not txt or len(self.search_results) == 0:
+        if not txt:
+            QMessageBox.information(self, "提示", "请在“页面内查找”中输入要查找的文本")
             return
-        self.find_busy = True
-
+        if not self.search_results:
+            self.label_stat.setText("暂无搜索结果，请先执行扫描")
+            return
         if txt != self.last_find_text:
             self.find_index = 0
             self.last_find_text = txt
@@ -1723,26 +1765,20 @@ class MainWindow(QMainWindow):
 
         if found_pos >= 0:
             self.find_index = found_pos + 1
-            item = self.search_results[found_pos]
-            line_text = f"[{os.path.basename(item.filepath)}] L{item.line_no}: {item.line_content}"
-            doc = self.tab_result.document()
-            cursor = doc.find(line_text)
-            if not cursor.isNull():
-                self.tab_result.setTextCursor(cursor)
-                self.tab_result.ensureCursorVisible()
+            self._locate_search_result(found_pos)
         else:
+            self.find_index = 0
+            self.label_stat.setText(f"未找到包含“{txt}”的内容")
             QMessageBox.information(self, "提示", "没有更匹配结果")
 
-        QTimer.singleShot(200, self._release_find_busy)
-
     def find_prev(self):
-        if self.find_busy:
-            return
         txt = self.edit_find.text().strip()
-        if not txt or len(self.search_results) == 0:
+        if not txt:
+            QMessageBox.information(self, "提示", "请在“页面内查找”中输入要查找的文本")
             return
-        self.find_busy = True
-
+        if not self.search_results:
+            self.label_stat.setText("暂无搜索结果，请先执行扫描")
+            return
         if txt != self.last_find_text:
             self.find_index = len(self.search_results) - 1
             self.last_find_text = txt
@@ -1760,20 +1796,23 @@ class MainWindow(QMainWindow):
 
         if found_pos >= 0:
             self.find_index = found_pos - 1
-            item = self.search_results[found_pos]
-            line_text = f"[{os.path.basename(item.filepath)}] L{item.line_no}: {item.line_content}"
-            doc = self.tab_result.document()
-            cursor = doc.find(line_text)
-            if not cursor.isNull():
-                self.tab_result.setTextCursor(cursor)
-                self.tab_result.ensureCursorVisible()
+            self._locate_search_result(found_pos)
         else:
+            self.find_index = len(self.search_results) - 1
+            self.label_stat.setText(f"未找到包含“{txt}”的内容")
             QMessageBox.information(self, "提示", "没有更匹配结果")
 
-        QTimer.singleShot(200, self._release_find_busy)
-
-    def _release_find_busy(self):
-        self.find_busy = False
+    def _locate_search_result(self, found_pos):
+        item = self.search_results[found_pos]
+        doc = self.tab_result.document()
+        line_text = item.line_content
+        cursor = doc.find(line_text)
+        if not cursor.isNull():
+            self.tab_result.setTextCursor(cursor)
+            self.tab_result.ensureCursorVisible()
+        self.label_stat.setText(
+            f"第 {found_pos + 1}/{len(self.search_results)} 条 | 文件："
+            f"{os.path.basename(item.filepath)} | 行号：{item.line_no}")
 
     def _clean_path(self, p):
         return p.strip().strip("|").strip()
